@@ -39,6 +39,27 @@ class VideoDownloadError(DownloadError):
     """Video download failed."""
 
 
+def _cookies_from_browser_option(value: str | None) -> list[str] | tuple[str, str] | None:
+    """Convert the friendly ``browser[:profile]`` form to yt-dlp's API value.
+
+    The yt-dlp Python API expects a two-item tuple for an explicit browser
+    profile.  Passing ``["firefox:profile"]`` (what the old code did) makes
+    yt-dlp interpret the whole string as a browser name and fail with
+    ``unsupported browser``.  Keep the one-item list for the plain browser
+    form for backwards compatibility with existing callers and tests.
+    """
+    if not value:
+        return None
+    browser, separator, profile = value.partition(":")
+    if not separator:
+        return [browser]
+    browser = browser.strip()
+    profile = profile.strip()
+    if not browser or not profile:
+        return [value]
+    return (browser, profile)
+
+
 def _positive_timeout(value: object, name: str) -> float:
     try:
         timeout = float(value)
@@ -92,8 +113,18 @@ def _apply_client_options(ydl_opts: dict, client: str) -> None:
     elif client == "tv_embedded":
         ydl_opts.setdefault("extractor_args", {})
         ydl_opts["extractor_args"]["youtube"] = {"player_client": "tv_embedded"}
-    elif client != "web":
-        raise DownloadError(f"Unknown client {client!r}. Choose from: web, android, ios, tv_embedded.")
+    elif client == "web":
+        # Keep the public ``web`` value meaningful.  Previously it left
+        # yt-dlp in its implicit client-selection mode, so ``web`` actually
+        # meant "auto" and could change with yt-dlp updates/cookies.
+        ydl_opts.setdefault("extractor_args", {})
+        ydl_opts["extractor_args"]["youtube"] = {"player_client": "web"}
+    elif client == "auto":
+        # Explicit opt-in to yt-dlp's default client selection.  This is
+        # useful as a fallback but must not be confused with the web profile.
+        return
+    else:
+        raise DownloadError(f"Unknown client {client!r}. Choose from: web, auto, android, ios, tv_embedded.")
 
 
 def _check_ffmpeg() -> None:
@@ -153,7 +184,7 @@ def get_stream_url(
     if resolved:
         ydl_opts["proxy"] = resolved
     if cookies_from_browser:
-        ydl_opts["cookiesfrombrowser"] = [cookies_from_browser]
+        ydl_opts["cookiesfrombrowser"] = _cookies_from_browser_option(cookies_from_browser)
     _apply_ytdlp_socket_timeout(ydl_opts, ytdlp_socket_timeout)
     _apply_client_options(ydl_opts, client)
 
@@ -195,7 +226,7 @@ def get_video_duration(
     if resolved:
         ydl_opts["proxy"] = resolved
     if cookies_from_browser:
-        ydl_opts["cookiesfrombrowser"] = [cookies_from_browser]
+        ydl_opts["cookiesfrombrowser"] = _cookies_from_browser_option(cookies_from_browser)
     _apply_ytdlp_socket_timeout(ydl_opts, ytdlp_socket_timeout)
     _apply_client_options(ydl_opts, client)
 
@@ -287,7 +318,7 @@ def download_frame_source(
     if resolved:
         ydl_opts["proxy"] = resolved
     if cookies_from_browser:
-        ydl_opts["cookiesfrombrowser"] = [cookies_from_browser]
+        ydl_opts["cookiesfrombrowser"] = _cookies_from_browser_option(cookies_from_browser)
     _apply_ytdlp_socket_timeout(ydl_opts, ytdlp_socket_timeout)
     _apply_client_options(ydl_opts, client)
 
@@ -468,7 +499,7 @@ def download_video(
     if resolved:
         ydl_opts["proxy"] = resolved
     if cookies_from_browser:
-        ydl_opts["cookiesfrombrowser"] = [cookies_from_browser]
+        ydl_opts["cookiesfrombrowser"] = _cookies_from_browser_option(cookies_from_browser)
     _apply_ytdlp_socket_timeout(ydl_opts, ytdlp_socket_timeout)
     _apply_client_options(ydl_opts, client)
 
@@ -533,7 +564,10 @@ def download_audio(
         outtmpl=out_template,
         postprocessors=[
             {
-                "key": "FFmpegExtractAudioPP",
+                # yt-dlp appends ``PP`` when resolving postprocessor class
+                # names.  Supplying the already-suffixed name makes it look
+                # for the non-existent ``FFmpegExtractAudioPPPP`` class.
+                "key": "FFmpegExtractAudio",
                 "preferredcodec": _AUDIO_FORMAT_MAP[audio_format],
             }
         ],
@@ -542,7 +576,7 @@ def download_audio(
     if resolved:
         ydl_opts["proxy"] = resolved
     if cookies_from_browser:
-        ydl_opts["cookiesfrombrowser"] = [cookies_from_browser]
+        ydl_opts["cookiesfrombrowser"] = _cookies_from_browser_option(cookies_from_browser)
     _apply_ytdlp_socket_timeout(ydl_opts, ytdlp_socket_timeout)
     _apply_client_options(ydl_opts, client)
 

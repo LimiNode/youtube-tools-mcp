@@ -23,7 +23,12 @@ from youtube_transcript_api.proxies import GenericProxyConfig
 
 from youtube_tools_mcp.utils.proxy import get_proxy_url
 from youtube_tools_mcp.utils.text import format_timestamp
-from youtube_tools_mcp.youtube.downloader import _apply_client_options, _apply_ytdlp_socket_timeout, _base_ytdlp_opts
+from youtube_tools_mcp.youtube.downloader import (
+    _apply_client_options,
+    _apply_ytdlp_socket_timeout,
+    _base_ytdlp_opts,
+    _cookies_from_browser_option,
+)
 
 DEFAULT_YOUTUBE_TRANSCRIPT_API_REQUEST_TIMEOUT = 5.0
 YOUTUBE_TRANSCRIPT_API_REQUEST_TIMEOUT_ENV = "YOUTUBE_TOOLS_TRANSCRIPT_API_REQUEST_TIMEOUT"
@@ -51,6 +56,15 @@ class InvalidVideoIdError(TranscriptError):
 
 class TranscriptFetchError(TranscriptError):
     """Failed to fetch the transcript for an unexpected reason."""
+
+
+_CREDENTIALS_IN_URL_RE = re.compile(r"(?i)(https?://)([^/@\s]+):([^/@\s]+)@")
+
+
+def _safe_error(exc: Exception) -> str:
+    """Return a bounded error string without proxy credentials."""
+    message = _CREDENTIALS_IN_URL_RE.sub(r"\1<redacted>@", str(exc))
+    return message.replace("\r", " ").replace("\n", " ")[:500]
 
 
 class _TimeoutSession(Session):
@@ -285,7 +299,7 @@ def fetch_transcript_via_ytdlp(
     if resolved_proxy:
         ydl_opts["proxy"] = resolved_proxy
     if cookies_from_browser:
-        ydl_opts["cookiesfrombrowser"] = [cookies_from_browser]
+        ydl_opts["cookiesfrombrowser"] = _cookies_from_browser_option(cookies_from_browser)
 
     try:
         _apply_ytdlp_socket_timeout(ydl_opts, ytdlp_socket_timeout)
@@ -350,14 +364,138 @@ class TranscriptFetcher:
 
     def _fetch_via_ytdlp(self, video_id: str, languages: tuple[str, ...]) -> str:
         """Fetch via yt-dlp subtitles."""
+        return self._fetch_via_ytdlp_client(video_id, languages, self._client)
+
+    def _fetch_via_ytdlp_client(
+        self,
+        video_id: str,
+        languages: tuple[str, ...],
+        client: str,
+    ) -> str:
+        """Fetch via yt-dlp using one concrete client profile."""
         return fetch_transcript_via_ytdlp(
             video_id,
             languages,
             proxy=self._proxy_url,
             cookies_from_browser=self._cookies_from_browser,
-            client=self._client,
+            client=client,
             ytdlp_socket_timeout=self._ytdlp_socket_timeout,
         )
+
+    def _client_candidates(self) -> list[str]:
+        """Return the requested client followed by useful YouTube fallbacks."""
+        defaults = ["web", "android", "ios", "tv_embedded"]
+        if self._client == "auto":
+            defaults = ["auto", *defaults]
+        return [self._client, *(client for client in defaults if client != self._client)]
+
+    @staticmethod
+    def _should_rotate_client(exc: TranscriptFetchError) -> bool:
+        """Detect failures for which changing the YouTube profile is useful.
+
+        yt-dlp wraps YouTube's bot checks and throttling responses in regular
+        exceptions, so the check intentionally uses the rendered message.
+        Ordinary parsing/file errors should go straight to the next fallback.
+        """
+        message = str(exc).lower()
+        markers = (
+            "bot",
+            "captcha",
+            "sign in",
+            "sign-in",
+            "login",
+            "http error 403",
+            "http error 429",
+            "too many requests",
+            "po token",
+            "player response",
+            "confirm you're not a bot",
+            "no supported subtitles",
+            "no subtitles available",
+            "requested format is not available",
+        )
+        return any(marker in message for marker in markers)
+
+    def _fetch_via_ytdlp_with_clients(
+        self,
+        video_id: str,
+        languages: tuple[str, ...],
+    ) -> str:
+        """Try alternate yt-dlp client profiles after a YouTube anti-bot failure."""
+        errors: list[str] = []
+        candidates = self._client_candidates()
+        for index, client in enumerate(candidates):
+            try:
+                if client == self._client:
+                    result = self._fetch_via_ytdlp(video_id, languages)
+                else:
+                    result = self._fetch_via_ytdlp_client(video_id, languages, client)
+                return result
+            except TranscriptFetchError as exc:
+                errors.append(f"client={client}: {_safe_error(exc)}")
+                if index == len(candidates) - 1 or not self._should_rotate_client(exc):
+                    break
+
+        raise TranscriptFetchError("yt-dlp transcript attempts failed: " + " | ".join(errors))
+
+    def diagnose(self, video_id: str, languages: tuple[str, ...]) -> dict[str, object]:
+        """Probe transcript backends and return non-secret attempt diagnostics."""
+        attempts: list[dict[str, object]] = []
+        for index, client in enumerate(self._client_candidates()):
+            try:
+                value = self._fetch_via_ytdlp_client(video_id, languages, client)
+                attempts.append(
+                    {
+                        "backend": "yt_dlp",
+                        "client": client,
+                        "proxy_configured": self._proxy_url is not None,
+                        "cookies_configured": self._cookies_from_browser is not None,
+                        "result": "success",
+                        "lines": len(value.splitlines()),
+                    }
+                )
+                return {"status": "success", "backend": "yt_dlp", "attempts": attempts}
+            except Exception as exc:
+                attempts.append(
+                    {
+                        "backend": "yt_dlp",
+                        "client": client,
+                        "proxy_configured": self._proxy_url is not None,
+                        "cookies_configured": self._cookies_from_browser is not None,
+                        "result": "failed",
+                        "error": _safe_error(exc),
+                    }
+                )
+                if index == len(self._client_candidates()) - 1 or not isinstance(exc, TranscriptFetchError):
+                    break
+                if not self._should_rotate_client(exc):
+                    break
+
+        try:
+            value = self._fetch_yta(video_id, languages)
+            attempts.append(
+                {
+                    "backend": "youtube_transcript_api",
+                    "client": "not_applicable",
+                    "proxy_configured": self._proxy_url is not None,
+                    "cookies_configured": False,
+                    "result": "success",
+                    "lines": len(value.splitlines()),
+                }
+            )
+            return {"status": "success", "backend": "youtube_transcript_api", "attempts": attempts}
+        except Exception as exc:
+            attempts.append(
+                {
+                    "backend": "youtube_transcript_api",
+                    "client": "not_applicable",
+                    "proxy_configured": self._proxy_url is not None,
+                    "cookies_configured": False,
+                    "result": "failed",
+                    "error": _safe_error(exc),
+                }
+            )
+            return {"status": "failed", "attempts": attempts}
 
     def _fetch_via_captions_api(self, video_id: str, languages: tuple[str, ...]) -> str:
         """Fetch via YouTube Data API captions (requires OAuth)."""
@@ -384,7 +522,7 @@ class TranscriptFetcher:
         errors = list(initial_errors or [])
         if not skip_ytdlp:
             try:
-                return self._fetch_via_ytdlp(video_id, languages)
+                return self._fetch_via_ytdlp_with_clients(video_id, languages)
             except TranscriptFetchError as exc:
                 errors.append(f"yt-dlp fallback failed: {exc}")
         try:
@@ -408,15 +546,27 @@ class TranscriptFetcher:
         ytdlp_first_errors: list[str] = []
         if self._cookies_from_browser:
             try:
-                return self._fetch_via_ytdlp(video_id, languages)
+                return self._fetch_via_ytdlp_with_clients(video_id, languages)
             except TranscriptFetchError as exc:
                 ytdlp_first_errors.append(f"yt-dlp first attempt failed: {exc}")
 
         try:
             return self._fetch_yta(video_id, languages)
-        except (TranscriptsDisabled, NoTranscriptFound, InvalidVideoId, VideoUnplayable) as exc:
-            # Definitive errors — no point trying fallback
+        except (TranscriptsDisabled, InvalidVideoId, VideoUnplayable) as exc:
+            # These errors describe the video itself, not just one transcript
+            # backend or language selection.
             raise _map_exception(exc) from exc
+        except NoTranscriptFound as exc:
+            # youtube-transcript-api can fail to enumerate a track while
+            # yt-dlp still sees it (different clients/endpoints/languages).
+            # Treat this as a backend miss and continue the normal fallbacks.
+            return self._try_fallbacks(
+                video_id,
+                languages,
+                exc,
+                skip_ytdlp=bool(self._cookies_from_browser),
+                initial_errors=ytdlp_first_errors,
+            )
         except CouldNotRetrieveTranscript as exc:
             # IP blocked or other retrievable failure — try fallbacks
             return self._try_fallbacks(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 
 from mcp.shared.exceptions import McpError
@@ -87,5 +88,31 @@ def get_youtube_transcript(
             f"Failed to fetch transcript: {exc}. "
             "If YouTube returned a bot-check, captcha, sign-in, or anti-abuse message, "
             "retry the same tool call with the proxy parameter, or with a different proxy if proxy was already used, "
-            "or try cookies_from_browser (e.g. 'chrome', 'firefox'), or try client='android'."
+            "or try cookies_from_browser (e.g. 'chrome', 'firefox'), or try client='android'. "
+            "The server tries the requested client first and rotates through supported "
+            "profiles for anti-bot failures."
         ) from exc
+
+
+def diagnose_youtube_access(
+    url_or_id: str,
+    languages: list[str] | None = None,
+    proxy: str | None = None,
+    cookies_from_browser: str | None = None,
+    client: str = "web",
+) -> str:
+    """Probe transcript backends and return non-secret JSON diagnostics."""
+    if languages is None:
+        languages = ["ru", "en"]
+    cookies_from_browser = _default_cookies_from_browser(cookies_from_browser)
+    try:
+        video_id = extract_video_id(url_or_id)
+    except ValueError as exc:
+        raise _err(str(exc)) from exc
+
+    fetcher = TranscriptFetcher(
+        proxy_url=proxy,
+        cookies_from_browser=cookies_from_browser,
+        client=client,
+    )
+    return json.dumps(fetcher.diagnose(video_id, tuple(languages)), ensure_ascii=False)

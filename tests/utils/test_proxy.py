@@ -10,6 +10,10 @@ class TestGetProxyUrl:
         with patch.dict("os.environ", {"HTTPS_PROXY": "http://env-proxy:8080"}, clear=True):
             assert get_proxy_url("http://arg-proxy:9090") == "http://arg-proxy:9090"
 
+    def test_blank_explicit_proxy_disables_environment(self) -> None:
+        with patch.dict("os.environ", {"HTTPS_PROXY": "http://env-proxy:8080"}, clear=True):
+            assert get_proxy_url("  ") is None
+
     def test_https_proxy_uppercase(self) -> None:
         with patch.dict("os.environ", {"HTTPS_PROXY": "http://proxy:8080"}, clear=True):
             assert get_proxy_url() == "http://proxy:8080"

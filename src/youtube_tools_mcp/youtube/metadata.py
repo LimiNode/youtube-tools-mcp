@@ -10,7 +10,12 @@ from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 from youtube_tools_mcp.utils.proxy import get_proxy_url
 from youtube_tools_mcp.utils.url import normalize_url
-from youtube_tools_mcp.youtube.downloader import _apply_client_options, _apply_ytdlp_socket_timeout, _base_ytdlp_opts
+from youtube_tools_mcp.youtube.downloader import (
+    _apply_client_options,
+    _apply_ytdlp_socket_timeout,
+    _base_ytdlp_opts,
+    _cookies_from_browser_option,
+)
 
 
 class MetadataError(Exception):
@@ -139,7 +144,7 @@ def fetch_video_metadata_ytdlp(
     if resolved:
         ydl_opts["proxy"] = resolved
     if cookies_from_browser:
-        ydl_opts["cookiesfrombrowser"] = [cookies_from_browser]
+        ydl_opts["cookiesfrombrowser"] = _cookies_from_browser_option(cookies_from_browser)
 
     try:
         _apply_ytdlp_socket_timeout(ydl_opts, ytdlp_socket_timeout)

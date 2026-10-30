@@ -35,6 +35,7 @@ from youtube_tools_mcp.tools.listing import (
     list_playlist_videos_tool as _list_playlist_videos,
 )
 from youtube_tools_mcp.tools.metadata import get_youtube_video_metadata as _get_youtube_video_metadata
+from youtube_tools_mcp.tools.transcript import diagnose_youtube_access as _diagnose_youtube_access
 from youtube_tools_mcp.tools.transcript import get_youtube_transcript as _get_youtube_transcript
 from youtube_tools_mcp.tools.video_context import get_youtube_video_context as _get_youtube_video_context
 
@@ -90,6 +91,22 @@ def get_youtube_transcript(
         transcript_api_timeout,
         ytdlp_socket_timeout,
     )
+
+
+@mcp.tool()
+def diagnose_youtube_access(
+    url_or_id: str,
+    languages: list[str] | None = None,
+    proxy: str | None = None,
+    cookies_from_browser: str | None = None,
+    client: str = "web",
+) -> str:
+    """Probe transcript backends and return non-secret JSON diagnostics.
+
+    The result contains backend/client attempts and boolean proxy/cookie flags,
+    never proxy URLs, credentials, browser paths, or cookie values.
+    """
+    return _diagnose_youtube_access(url_or_id, languages, proxy, cookies_from_browser, client)
 
 
 @mcp.tool()

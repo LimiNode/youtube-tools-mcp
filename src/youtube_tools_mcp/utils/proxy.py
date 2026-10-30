@@ -14,7 +14,10 @@ def get_proxy_url(proxy: str | None = None) -> str | None:
     Returns None if no proxy is configured.
     """
     if proxy is not None:
-        return proxy
+        # An explicit blank value means "disable proxy" for this call.  Do
+        # not pass an empty URL to requests/youtube-transcript-api: it is
+        # neither a usable proxy nor the same as ``None`` for all clients.
+        return proxy.strip() or None
     return (
         os.environ.get("HTTPS_PROXY")
         or os.environ.get("https_proxy")

@@ -18,7 +18,6 @@ from youtube_transcript_api.proxies import GenericProxyConfig
 
 from youtube_tools_mcp.youtube.transcript import (
     InvalidVideoIdError,
-    NoTranscriptFoundError,
     TranscriptFetcher,
     TranscriptFetchError,
     TranscriptsDisabledError,
@@ -139,8 +138,13 @@ class TestTranscriptFetcher:
         mock_api.fetch.side_effect = NoTranscriptFound(SAMPLE_VIDEO_ID, ["en"], [])
 
         fetcher = TranscriptFetcher()
-        with pytest.raises(NoTranscriptFoundError):
-            fetcher.fetch(SAMPLE_VIDEO_ID)
+        with patch.object(
+            TranscriptFetcher,
+            "_fetch_via_ytdlp",
+            return_value="[00:01] ytdlp line",
+        ) as mock_ytdlp:
+            assert fetcher.fetch(SAMPLE_VIDEO_ID) == "[00:01] ytdlp line"
+            mock_ytdlp.assert_called_once_with(SAMPLE_VIDEO_ID, ("en",))
 
     @patch("youtube_tools_mcp.youtube.transcript.YouTubeTranscriptApi")
     def test_fetch_invalid_video_id(self, mock_api_cls: MagicMock) -> None:
@@ -313,7 +317,7 @@ class TestTranscriptFetcher:
             mock_fallback.assert_not_called()
 
     @patch("youtube_tools_mcp.youtube.transcript.YouTubeTranscriptApi")
-    def test_fetch_no_fallback_for_no_transcript_found(
+    def test_fetch_falls_back_for_backend_specific_no_transcript_found(
         self,
         mock_api_cls: MagicMock,
     ) -> None:
@@ -321,12 +325,36 @@ class TestTranscriptFetcher:
         mock_api.fetch.side_effect = NoTranscriptFound(SAMPLE_VIDEO_ID, ["en"], [])
 
         fetcher = TranscriptFetcher()
-        with patch(
-            "youtube_tools_mcp.youtube.transcript.TranscriptFetcher._fetch_via_captions_api",
-        ) as mock_fallback:
-            with pytest.raises(NoTranscriptFoundError):
-                fetcher.fetch(SAMPLE_VIDEO_ID)
-            mock_fallback.assert_not_called()
+        with (
+            patch.object(
+                TranscriptFetcher,
+                "_fetch_via_ytdlp",
+                side_effect=TranscriptFetchError("ytdlp unavailable"),
+            ),
+            patch(
+                "youtube_tools_mcp.youtube.transcript.TranscriptFetcher._fetch_via_captions_api",
+                return_value="[00:02] captions line",
+            ) as mock_fallback,
+        ):
+            assert fetcher.fetch(SAMPLE_VIDEO_ID) == "[00:02] captions line"
+            mock_fallback.assert_called_once()
+
+    @patch("youtube_tools_mcp.youtube.transcript.YouTubeTranscriptApi")
+    def test_fetch_no_transcript_falls_back_to_ytdlp_before_captions(
+        self,
+        mock_api_cls: MagicMock,
+    ) -> None:
+        mock_api = mock_api_cls.return_value
+        mock_api.fetch.side_effect = NoTranscriptFound(SAMPLE_VIDEO_ID, ["en"], [])
+
+        fetcher = TranscriptFetcher()
+        with patch.object(
+            TranscriptFetcher,
+            "_fetch_via_ytdlp",
+            return_value="[00:01] ytdlp line",
+        ) as mock_ytdlp:
+            assert fetcher.fetch(SAMPLE_VIDEO_ID) == "[00:01] ytdlp line"
+            mock_ytdlp.assert_called_once_with(SAMPLE_VIDEO_ID, ("en",))
 
     @patch("youtube_tools_mcp.youtube.transcript.YouTubeTranscriptApi")
     def test_fetch_uses_ytdlp_first_when_cookies_set(
@@ -371,6 +399,60 @@ class TestTranscriptFetcher:
         assert result == "[00:02] captions line"
         mock_ytdlp.assert_called_once()
         mock_captions.assert_called_once()
+
+    @patch("youtube_tools_mcp.youtube.transcript.YouTubeTranscriptApi")
+    def test_fetch_rotates_ytdlp_client_after_bot_check(
+        self,
+        mock_api_cls: MagicMock,
+    ) -> None:
+        mock_api = mock_api_cls.return_value
+        mock_api.fetch.side_effect = CouldNotRetrieveTranscript("blocked")
+
+        fetcher = TranscriptFetcher(cookies_from_browser="firefox", client="web")
+        with (
+            patch.object(
+                TranscriptFetcher,
+                "_fetch_via_ytdlp",
+                side_effect=TranscriptFetchError("Sign in to confirm you're not a bot"),
+            ) as web_attempt,
+            patch.object(
+                TranscriptFetcher,
+                "_fetch_via_ytdlp_client",
+                return_value="[00:01] android line",
+            ) as alternate_attempt,
+        ):
+            result = fetcher.fetch(SAMPLE_VIDEO_ID)
+
+        assert result == "[00:01] android line"
+        web_attempt.assert_called_once_with(SAMPLE_VIDEO_ID, ("en",))
+        alternate_attempt.assert_called_once_with(SAMPLE_VIDEO_ID, ("en",), "android")
+
+    @patch("youtube_tools_mcp.youtube.transcript.YouTubeTranscriptApi")
+    def test_fetch_does_not_rotate_for_non_antibot_ytdlp_error(
+        self,
+        mock_api_cls: MagicMock,
+    ) -> None:
+        mock_api = mock_api_cls.return_value
+        mock_api.fetch.side_effect = CouldNotRetrieveTranscript("blocked")
+
+        fetcher = TranscriptFetcher(cookies_from_browser="firefox")
+        with (
+            patch.object(
+                TranscriptFetcher,
+                "_fetch_via_ytdlp",
+                side_effect=TranscriptFetchError("subtitle parsing failed"),
+            ) as ytdlp,
+            patch.object(
+                TranscriptFetcher,
+                "_fetch_via_captions_api",
+                return_value="[00:02] captions line",
+            ) as captions,
+        ):
+            result = fetcher.fetch(SAMPLE_VIDEO_ID)
+
+        assert result == "[00:02] captions line"
+        ytdlp.assert_called_once_with(SAMPLE_VIDEO_ID, ("en",))
+        captions.assert_called_once()
 
 
 class TestParseJson3Events:

@@ -14,6 +14,7 @@ from youtube_tools_mcp.youtube.downloader import (
     FFmpegOutputError,
     StreamUrlError,
     _base_ytdlp_opts,
+    _cookies_from_browser_option,
     download_audio,
     download_frame_source,
     download_video,
@@ -23,6 +24,11 @@ from youtube_tools_mcp.youtube.downloader import (
     get_stream_url,
     get_video_duration,
 )
+
+
+def test_cookies_from_browser_option_supports_explicit_profile() -> None:
+    assert _cookies_from_browser_option("firefox") == ["firefox"]
+    assert _cookies_from_browser_option("firefox:profile-name") == ("firefox", "profile-name")
 
 
 def _mock_ytdl_context(mock_ytdl_cls: MagicMock, info: dict) -> None:
@@ -72,6 +78,24 @@ class TestGetStreamUrl:
         opts = mock_ydl_cls.call_args[0][0]
         assert "Android" in opts["user_agent"]
         assert opts["extractor_args"]["youtube"]["player_client"] == "android"
+
+    @patch("yt_dlp.YoutubeDL")
+    def test_uses_explicit_web_client_when_set(self, mock_ydl_cls: MagicMock) -> None:
+        _mock_ytdl_context(mock_ydl_cls, {"url": "https://stream.url/video.mp4", "duration": 210.5})
+
+        get_stream_url("dQw4w9WgXcQ", client="web")
+
+        opts = mock_ydl_cls.call_args[0][0]
+        assert opts["extractor_args"]["youtube"]["player_client"] == "web"
+
+    @patch("yt_dlp.YoutubeDL")
+    def test_auto_client_leaves_yt_dlp_selection_unchanged(self, mock_ydl_cls: MagicMock) -> None:
+        _mock_ytdl_context(mock_ydl_cls, {"url": "https://stream.url/video.mp4", "duration": 210.5})
+
+        get_stream_url("dQw4w9WgXcQ", client="auto")
+
+        opts = mock_ydl_cls.call_args[0][0]
+        assert "extractor_args" not in opts
 
     @patch("yt_dlp.YoutubeDL")
     def test_uses_ytdlp_socket_timeout_when_set(self, mock_ydl_cls: MagicMock) -> None:
@@ -546,6 +570,7 @@ class TestDownloadAudio:
             )
 
         opts = mock_ydl_cls.call_args[0][0]
+        assert opts["postprocessors"][0]["key"] == "FFmpegExtractAudio"
         assert opts["proxy"] == "http://proxy:8080"
         assert opts["cookiesfrombrowser"] == ["firefox"]
         assert opts["socket_timeout"] == 15.0

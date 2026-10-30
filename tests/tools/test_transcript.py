@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 from mcp.shared.exceptions import McpError
 
-from youtube_tools_mcp.tools.transcript import get_youtube_transcript
+from youtube_tools_mcp.tools.transcript import diagnose_youtube_access, get_youtube_transcript
 from youtube_tools_mcp.youtube.transcript import (
     InvalidVideoIdError,
     NoTranscriptFoundError,
@@ -218,4 +219,40 @@ class TestGetYoutubeTranscript:
             client="web",
             transcript_api_timeout=12.5,
             ytdlp_socket_timeout=30.0,
+        )
+
+
+class TestDiagnoseYoutubeAccess:
+    @patch("youtube_tools_mcp.tools.transcript.TranscriptFetcher")
+    def test_returns_non_secret_diagnostics(self, mock_fetcher_cls: MagicMock) -> None:
+        mock_fetcher_cls.return_value.diagnose.return_value = {
+            "status": "success",
+            "backend": "yt_dlp",
+            "attempts": [
+                {
+                    "backend": "yt_dlp",
+                    "client": "android",
+                    "proxy_configured": True,
+                    "cookies_configured": True,
+                    "result": "success",
+                    "lines": 107,
+                }
+            ],
+        }
+
+        result = json.loads(
+            diagnose_youtube_access(
+                SAMPLE_URL,
+                cookies_from_browser="firefox",
+                client="android",
+            )
+        )
+
+        assert result["status"] == "success"
+        assert result["attempts"][0]["proxy_configured"] is True
+        assert "firefox" not in json.dumps(result).lower()
+        mock_fetcher_cls.assert_called_once_with(
+            proxy_url=None,
+            cookies_from_browser="firefox",
+            client="android",
         )

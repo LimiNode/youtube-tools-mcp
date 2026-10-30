@@ -10,7 +10,7 @@ from youtube_tools_mcp.utils.url import (
     normalize_url,
     resolve_channel_handle,
 )
-from youtube_tools_mcp.youtube.downloader import _apply_client_options, _base_ytdlp_opts
+from youtube_tools_mcp.youtube.downloader import _apply_client_options, _base_ytdlp_opts, _cookies_from_browser_option
 from youtube_tools_mcp.youtube.metadata import _first_item, _youtube_api_get
 
 
@@ -82,7 +82,7 @@ def _extract_entries_ytdlp(
     if resolved:
         ydl_opts["proxy"] = resolved
     if cookies_from_browser:
-        ydl_opts["cookiesfrombrowser"] = [cookies_from_browser]
+        ydl_opts["cookiesfrombrowser"] = _cookies_from_browser_option(cookies_from_browser)
     _apply_client_options(ydl_opts, client)
 
     try:

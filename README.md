@@ -22,6 +22,7 @@ Designed for Claude Code, VSCodium, and any MCP-compatible agent.
 | Tool | Description |
 |---|---|
 | `get_youtube_transcript` | Extract transcript/subtitles from a YouTube video |
+| `diagnose_youtube_access` | Probe transcript backends and clients; returns non-secret attempt diagnostics |
 | `get_youtube_video_metadata` | Fetch video title, description, channel URL, and channel description when available |
 | `get_youtube_video_context` | Fetch video metadata plus transcript in one JSON response |
 | `clean_transcript` | Clean and format auto-generated transcript text |
@@ -356,7 +357,8 @@ The token file is stored on the machine where the server runs. For remote or con
 
 **How it works:**
 
-- `get_youtube_transcript` first tries `youtube-transcript-api`.
+- `get_youtube_transcript` uses `yt-dlp` first when browser cookies are configured; otherwise it starts with `youtube-transcript-api`.
+- A language miss from one backend (`NoTranscriptFound`) is not treated as proof that the video has no captions: the other transcript backends are still tried.
 - If the request is blocked (`RequestBlocked`), it falls back to `captions.download` via YouTube Data API.
 - The OAuth token is auto-refreshed before each call; you do not need to re-authorize unless the token is revoked.
 - `YOUTUBE_API_KEY` is still recommended because it enables `captions.list` (which needs no OAuth), but OAuth handles the actual download.
@@ -371,6 +373,17 @@ Supported values include any `yt-dlp` browser syntax, for example:
 
 - `"chrome"`, `"firefox"`, `"edge"`, `"safari"`
 - `"chrome:Profile 1"` for a specific profile
+
+The `client` argument controls the yt-dlp YouTube client profile. `"web"` is
+an explicit web Innertube profile, while `"auto"` leaves client selection to
+yt-dlp. `"android"`, `"ios"`, and `"tv_embedded"` select those profiles
+explicitly. On anti-bot failures the transcript path tries the requested
+profile first and then rotates through the supported alternatives.
+
+The Python API adapter converts the `browser:profile` form to yt-dlp's
+two-item `(browser, profile)` value. This matters when the browser's default
+profile is not the one authenticated to YouTube; passing the whole string as a
+single list item makes yt-dlp report `unsupported browser`.
 
 For transcript extraction, you can make cookies the default in the MCP client config:
 
@@ -393,6 +406,17 @@ For transcript extraction, you can make cookies the default in the MCP client co
 ```
 
 When this default is set, `get_youtube_transcript` tries the `yt-dlp` subtitle path first instead of waiting for `youtube-transcript-api` to fail before falling back. This helps avoid MCP client call timeouts when YouTube repeatedly blocks unauthenticated transcript requests.
+
+Use `diagnose_youtube_access` when a transcript fails. It performs the same
+limited backend/client probes and returns JSON with `backend`, `client`,
+`result`, `proxy_configured`, and `cookies_configured`. It never returns proxy
+URLs, credentials, browser profile paths, or cookie values.
+
+`download_audio` uses the yt-dlp postprocessor key `FFmpegExtractAudio` (without
+the `PP` suffix). yt-dlp adds that suffix internally; using
+`FFmpegExtractAudioPP` causes the invalid `FFmpegExtractAudioPPPP` lookup.
+
+If the `yt-dlp` attempt receives a YouTube bot-check, captcha, sign-in/throttling response, or does not expose a subtitle track for the selected profile, the transcript fetcher automatically retries with the other supported client profiles (`android`, `ios`, and `tv_embedded`). The requested `client` is always tried first; cookies and proxy settings are applied to every retry.
 
 When no browser cookie default is set, `get_youtube_transcript` still applies `YOUTUBE_TOOLS_TRANSCRIPT_API_REQUEST_TIMEOUT` (default: `5` seconds) to each individual HTTP request made by `youtube-transcript-api` and can then continue to the yt-dlp subtitle fallback.
 
