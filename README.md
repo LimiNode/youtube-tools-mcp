@@ -246,6 +246,9 @@ When installed via `uvx` from an MCP client, the server may run outside your pro
 | `YOUTUBE_TOOLS_COOKIES_FROM_BROWSER` | No | Default browser cookie source for `get_youtube_transcript` when the tool call does not pass `cookies_from_browser`. Example: `firefox`. |
 | `YOUTUBE_TOOLS_TRANSCRIPT_API_REQUEST_TIMEOUT` | No | Positive finite per-request HTTP timeout in seconds for individual requests made by `youtube-transcript-api`. Defaults to `5`. Keeping this small helps the tool reach yt-dlp/Data API fallbacks before MCP client-level timeouts. |
 | `YOUTUBE_TOOLS_YTDLP_SOCKET_TIMEOUT` | No | Positive finite default socket timeout in seconds for yt-dlp network operations. Can be overridden per call with `ytdlp_socket_timeout` on supported tools. |
+| `YOUTUBE_TOOLS_TRANSCRIPT_TOTAL_TIMEOUT` | No | Positive finite total budget in seconds for one transcript fetch or diagnostic probe. Defaults to `45`. It bounds client rotation and Data API fallback; per-request socket/HTTP timeouts are reduced to the remaining budget. |
+| `YOUTUBE_TOOLS_MAX_CLIENT_ATTEMPTS` | No | Positive integer cap for yt-dlp YouTube client profiles attempted during one transcript fetch or diagnostic probe. Defaults to `3` (requested client first). |
+| `YOUTUBE_TOOLS_DIAGNOSTIC_IP_CHECK_URL` | No | Optional endpoint used only when `diagnose_youtube_access(check_ip=true)` is requested. Defaults to `https://api.ipify.org?format=json`; only a validated IP address is returned. |
 | `YOUTUBE_TOOLS_VISION_BASE_URL` | For vision analysis | OpenAI-compatible base URL. Falls back to `OPENAI_BASE_URL`, then `ANTHROPIC_BASE_URL` + `/v1`. |
 | `YOUTUBE_TOOLS_VISION_API_KEY` | For vision analysis | API token. Falls back to `OPENAI_API_KEY`. |
 | `YOUTUBE_TOOLS_VISION_MODEL` | For vision analysis | Vision-capable model. Falls back to `OPENAI_VISION_MODEL`, `ANTHROPIC_TOOL_USE_MODEL`, then `ANTHROPIC_MODEL`. |
@@ -407,16 +410,25 @@ For transcript extraction, you can make cookies the default in the MCP client co
 
 When this default is set, `get_youtube_transcript` tries the `yt-dlp` subtitle path first instead of waiting for `youtube-transcript-api` to fail before falling back. This helps avoid MCP client call timeouts when YouTube repeatedly blocks unauthenticated transcript requests.
 
-Use `diagnose_youtube_access` when a transcript fails. It performs the same
-limited backend/client probes and returns JSON with `backend`, `client`,
-`result`, `proxy_configured`, and `cookies_configured`. It never returns proxy
-URLs, credentials, browser profile paths, or cookie values.
+Use `diagnose_youtube_access` when a transcript fails. It performs a bounded
+probe and returns JSON with `backend`, `client`, `result`, normalized `reason`,
+`stages` (`metadata`, `track_discovery`, `subtitle_download` where applicable),
+`cookies_configured`, `cookies_loaded`, and a `budget` summary. `cookies_loaded`
+means yt-dlp exposed at least one cookie in the active cookie jar; it is kept
+separate from the fact that a browser source was configured. The diagnostic
+also records the YouTube Data API captions fallback when the OAuth fallback is
+available within the same budget. It never returns proxy URLs, credentials,
+browser profile paths, or cookie values.
+
+Pass `check_ip=true` when you need to verify the actual egress address used by
+the diagnostic probe. This is opt-in because it adds one external request and
+returns the observed public IP in the diagnostic result.
 
 `download_audio` uses the yt-dlp postprocessor key `FFmpegExtractAudio` (without
 the `PP` suffix). yt-dlp adds that suffix internally; using
 `FFmpegExtractAudioPP` causes the invalid `FFmpegExtractAudioPPPP` lookup.
 
-If the `yt-dlp` attempt receives a YouTube bot-check, captcha, sign-in/throttling response, or does not expose a subtitle track for the selected profile, the transcript fetcher automatically retries with the other supported client profiles (`android`, `ios`, and `tv_embedded`). The requested `client` is always tried first; cookies and proxy settings are applied to every retry.
+If the `yt-dlp` attempt receives a YouTube bot-check, captcha, or does not expose a subtitle track for the selected profile, the transcript fetcher retries with other supported client profiles. The requested `client` is always tried first; cookies and proxy settings are applied to every retry. The default cap is three client attempts; set `YOUTUBE_TOOLS_MAX_CLIENT_ATTEMPTS=4` to include all four built-in profiles (`web`, `android`, `ios`, `tv_embedded`). Rate-limit and ordinary HTTP 403 failures do not automatically fan out across all profiles.
 
 When no browser cookie default is set, `get_youtube_transcript` still applies `YOUTUBE_TOOLS_TRANSCRIPT_API_REQUEST_TIMEOUT` (default: `5` seconds) to each individual HTTP request made by `youtube-transcript-api` and can then continue to the yt-dlp subtitle fallback.
 

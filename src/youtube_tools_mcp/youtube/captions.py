@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from typing import Any
 
 from youtube_tools_mcp.utils.proxy import get_proxy_url
@@ -13,6 +15,7 @@ from youtube_tools_mcp.youtube.transcript import TranscriptFetchError
 
 _API_BASE = "https://www.googleapis.com/youtube/v3"
 _CAPTIONS_DOWNLOAD_URL = "https://www.googleapis.com/youtube/v3/captions"
+CaptionStageObserver = Callable[[dict[str, object]], None]
 
 
 class CaptionError(Exception):
@@ -21,6 +24,31 @@ class CaptionError(Exception):
 
 class CaptionDownloadError(CaptionError):
     """Failed to download caption track."""
+
+
+def _emit_stage(
+    observer: CaptionStageObserver | None,
+    stage: str,
+    result: str,
+    reason: str | None = None,
+) -> None:
+    if observer is None:
+        return
+    event: dict[str, object] = {"stage": stage, "result": result}
+    if reason is not None:
+        event["reason"] = reason
+    observer(event)
+
+
+def _caption_error_reason(exc: Exception) -> str:
+    message = str(exc).lower()
+    if "403" in message or "forbidden" in message:
+        return "forbidden"
+    if "429" in message or "rate" in message or "throttl" in message:
+        return "rate_limited"
+    if "timeout" in message or "connection" in message or "urlopen" in message:
+        return "network_error"
+    return "unknown"
 
 
 class CaptionListError(CaptionError):
@@ -32,6 +60,7 @@ def _api_get(
     params: dict[str, str],
     access_token: str | None = None,
     proxy: str | None = None,
+    timeout: float = 20.0,
 ) -> dict[str, Any]:
     query = urllib.parse.urlencode(params)
     url = f"{_API_BASE}/{endpoint}?{query}"
@@ -51,10 +80,10 @@ def _api_get(
 
     try:
         if opener is not None:
-            with opener.open(req, timeout=20) as response:
+            with opener.open(req, timeout=timeout) as response:
                 raw = response.read().decode("utf-8")
         else:
-            with urllib.request.urlopen(req, timeout=20) as response:  # noqa: S310
+            with urllib.request.urlopen(req, timeout=timeout) as response:  # noqa: S310
                 raw = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
@@ -73,6 +102,7 @@ def list_caption_tracks(
     api_key: str | None = None,
     access_token: str | None = None,
     proxy: str | None = None,
+    timeout: float = 20.0,
 ) -> list[dict[str, Any]]:
     """List available caption tracks for a video."""
     params: dict[str, str] = {"part": "snippet", "videoId": video_id}
@@ -80,7 +110,7 @@ def list_caption_tracks(
     if api_key:
         params["key"] = api_key
 
-    data = _api_get("captions", params, access_token=access_token, proxy=proxy)
+    data = _api_get("captions", params, access_token=access_token, proxy=proxy, timeout=timeout)
 
     items = data.get("items")
     if not isinstance(items, list):
@@ -109,6 +139,7 @@ def download_caption_track(
     caption_id: str,
     access_token: str,
     proxy: str | None = None,
+    timeout: float = 20.0,
 ) -> str:
     """Download a caption track as SRT."""
     params = {"tfmt": "srt"}
@@ -128,11 +159,10 @@ def download_caption_track(
 
     try:
         if opener is not None:
-            with opener.open(req, timeout=20) as response:
+            with opener.open(req, timeout=timeout) as response:
                 return response.read().decode("utf-8")
-        else:
-            with urllib.request.urlopen(req, timeout=20) as response:  # noqa: S310
-                return response.read().decode("utf-8")
+        with urllib.request.urlopen(req, timeout=timeout) as response:  # noqa: S310
+            return response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         raise CaptionDownloadError(f"HTTP {exc.code}: {body}") from exc
@@ -176,19 +206,47 @@ def fetch_transcript_via_data_api(
     languages: tuple[str, ...] = ("en",),
     api_key: str | None = None,
     proxy: str | None = None,
+    timeout: float | None = None,
+    attempt_observer: CaptionStageObserver | None = None,
 ) -> str:
     """Fetch transcript via YouTube Data API captions.download."""
+    deadline = time.monotonic() + timeout if timeout is not None else None
+
+    def remaining_timeout() -> float | None:
+        if deadline is None:
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TranscriptFetchError(
+                "YouTube Data API captions fallback exceeded its timeout",
+                reason="timeout",
+                stage="youtube_data_api",
+            )
+        return remaining
+
     access_token = get_access_token()
     if not access_token:
+        _emit_stage(attempt_observer, "track_discovery", "failed", "auth_error")
         raise TranscriptFetchError("OAuth token not available. Run `youtube-tools-mcp-oauth` to authorize.")
 
+    _emit_stage(attempt_observer, "track_discovery", "started")
     try:
-        tracks = list_caption_tracks(video_id, api_key=api_key, access_token=access_token, proxy=proxy)
+        list_kwargs: dict[str, object] = {
+            "api_key": api_key,
+            "access_token": access_token,
+            "proxy": proxy,
+        }
+        if timeout is not None:
+            list_kwargs["timeout"] = remaining_timeout()
+        tracks = list_caption_tracks(video_id, **list_kwargs)
     except CaptionError as exc:
+        _emit_stage(attempt_observer, "track_discovery", "failed", _caption_error_reason(exc))
         raise TranscriptFetchError(f"YouTube Data API captions fallback failed: {exc}") from exc
 
     if not tracks:
+        _emit_stage(attempt_observer, "track_discovery", "failed", "no_captions")
         raise TranscriptFetchError("No caption tracks found for this video")
+    _emit_stage(attempt_observer, "track_discovery", "success")
 
     selected_track: dict[str, Any] | None = None
 
@@ -224,12 +282,19 @@ def fetch_transcript_via_data_api(
 
     caption_id = selected_track.get("id")
     if not caption_id:
+        _emit_stage(attempt_observer, "subtitle_download", "failed", "no_captions")
         raise TranscriptFetchError("Selected caption track has no ID")
 
+    _emit_stage(attempt_observer, "subtitle_download", "started")
     try:
-        srt_text = download_caption_track(caption_id, access_token, proxy=proxy)
+        download_kwargs: dict[str, object] = {"proxy": proxy}
+        if timeout is not None:
+            download_kwargs["timeout"] = remaining_timeout()
+        srt_text = download_caption_track(caption_id, access_token, **download_kwargs)
     except CaptionError as exc:
+        _emit_stage(attempt_observer, "subtitle_download", "failed", _caption_error_reason(exc))
         raise TranscriptFetchError(f"YouTube Data API captions fallback failed: {exc}") from exc
+    _emit_stage(attempt_observer, "subtitle_download", "success")
     snippets = _parse_srt(srt_text)
 
     if not snippets:

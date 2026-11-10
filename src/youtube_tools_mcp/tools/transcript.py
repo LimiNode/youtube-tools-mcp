@@ -84,8 +84,10 @@ def get_youtube_transcript(
     except VideoUnavailableError as exc:
         raise _err(f"Video unavailable: {exc}") from exc
     except TranscriptError as exc:
+        reason = getattr(exc, "reason", None)
+        reason_suffix = f" [reason={reason}]" if reason else ""
         raise _err(
-            f"Failed to fetch transcript: {exc}. "
+            f"Failed to fetch transcript{reason_suffix}: {exc}. "
             "If YouTube returned a bot-check, captcha, sign-in, or anti-abuse message, "
             "retry the same tool call with the proxy parameter, or with a different proxy if proxy was already used, "
             "or try cookies_from_browser (e.g. 'chrome', 'firefox'), or try client='android'. "
@@ -100,8 +102,9 @@ def diagnose_youtube_access(
     proxy: str | None = None,
     cookies_from_browser: str | None = None,
     client: str = "web",
+    check_ip: bool = False,
 ) -> str:
-    """Probe transcript backends and return non-secret JSON diagnostics."""
+    """Probe transcript backends and return bounded, non-secret diagnostics."""
     if languages is None:
         languages = ["ru", "en"]
     cookies_from_browser = _default_cookies_from_browser(cookies_from_browser)
@@ -110,9 +113,12 @@ def diagnose_youtube_access(
     except ValueError as exc:
         raise _err(str(exc)) from exc
 
-    fetcher = TranscriptFetcher(
-        proxy_url=proxy,
-        cookies_from_browser=cookies_from_browser,
-        client=client,
-    )
-    return json.dumps(fetcher.diagnose(video_id, tuple(languages)), ensure_ascii=False)
+    try:
+        fetcher = TranscriptFetcher(
+            proxy_url=proxy,
+            cookies_from_browser=cookies_from_browser,
+            client=client,
+        )
+        return json.dumps(fetcher.diagnose(video_id, tuple(languages), check_ip=check_ip), ensure_ascii=False)
+    except TranscriptError as exc:
+        raise _err(f"Failed to diagnose YouTube access: {exc}") from exc
