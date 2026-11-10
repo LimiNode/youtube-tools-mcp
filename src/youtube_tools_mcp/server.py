@@ -100,13 +100,16 @@ def diagnose_youtube_access(
     proxy: str | None = None,
     cookies_from_browser: str | None = None,
     client: str = "web",
+    check_ip: bool = False,
 ) -> str:
     """Probe transcript backends and return non-secret JSON diagnostics.
 
     The result contains backend/client attempts and boolean proxy/cookie flags,
-    never proxy URLs, credentials, browser paths, or cookie values.
+    stage-level results, and a bounded budget summary. Set check_ip=True to
+    verify the observed egress IP through a public IP endpoint. The result
+    never contains proxy URLs, credentials, browser paths, or cookie values.
     """
-    return _diagnose_youtube_access(url_or_id, languages, proxy, cookies_from_browser, client)
+    return _diagnose_youtube_access(url_or_id, languages, proxy, cookies_from_browser, client, check_ip)
 
 
 @mcp.tool()

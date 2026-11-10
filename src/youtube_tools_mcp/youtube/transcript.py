@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import html
+import ipaddress
 import json
 import math
 import os
 import re
 import tempfile
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 from requests import Session
@@ -32,6 +35,14 @@ from youtube_tools_mcp.youtube.downloader import (
 
 DEFAULT_YOUTUBE_TRANSCRIPT_API_REQUEST_TIMEOUT = 5.0
 YOUTUBE_TRANSCRIPT_API_REQUEST_TIMEOUT_ENV = "YOUTUBE_TOOLS_TRANSCRIPT_API_REQUEST_TIMEOUT"
+DEFAULT_TRANSCRIPT_TOTAL_TIMEOUT = 45.0
+TRANSCRIPT_TOTAL_TIMEOUT_ENV = "YOUTUBE_TOOLS_TRANSCRIPT_TOTAL_TIMEOUT"
+DEFAULT_MAX_CLIENT_ATTEMPTS = 3
+MAX_CLIENT_ATTEMPTS_ENV = "YOUTUBE_TOOLS_MAX_CLIENT_ATTEMPTS"
+DEFAULT_IP_CHECK_URL = "https://api.ipify.org?format=json"
+IP_CHECK_URL_ENV = "YOUTUBE_TOOLS_DIAGNOSTIC_IP_CHECK_URL"
+
+TranscriptStageObserver = Callable[[dict[str, object]], None]
 
 
 class TranscriptError(Exception):
@@ -55,25 +66,94 @@ class InvalidVideoIdError(TranscriptError):
 
 
 class TranscriptFetchError(TranscriptError):
-    """Failed to fetch the transcript for an unexpected reason."""
+    """Failed to fetch the transcript for an unexpected reason.
+
+    ``reason`` and ``stage`` are deliberately small, stable values used by
+    diagnostics.  The human-readable message remains available through the
+    normal exception string and is sanitized before it is returned to MCP.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str = "unknown",
+        stage: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.stage = stage
 
 
 _CREDENTIALS_IN_URL_RE = re.compile(r"(?i)(https?://)([^/@\s]+):([^/@\s]+)@")
+_LOCAL_PATH_RE = re.compile(r"(?i)(?:[A-Za-z]:[\\/]|/(?:Users|home|tmp)/|\\\\)[^\s'\"|]+")
 
 
 def _safe_error(exc: Exception) -> str:
     """Return a bounded error string without proxy credentials."""
     message = _CREDENTIALS_IN_URL_RE.sub(r"\1<redacted>@", str(exc))
+    message = _LOCAL_PATH_RE.sub("<redacted-path>", message)
     return message.replace("\r", " ").replace("\n", " ")[:500]
+
+
+def _classify_error(exc: Exception) -> str:
+    """Map backend error text to a small machine-readable reason set."""
+    if isinstance(exc, TranscriptFetchError) and exc.reason != "unknown":
+        return exc.reason
+
+    if isinstance(exc, (InvalidVideoId, InvalidVideoIdError)):
+        return "invalid_video"
+    if isinstance(exc, (TranscriptsDisabled, TranscriptsDisabledError)):
+        return "transcripts_disabled"
+    if isinstance(exc, (VideoUnplayable, VideoUnavailableError)):
+        return "video_unavailable"
+    if isinstance(exc, (NoTranscriptFound, NoTranscriptFoundError)):
+        return "no_captions"
+
+    message = str(exc).lower()
+    if any(marker in message for marker in ("429", "too many requests", "rate limit", "throttl")):
+        return "rate_limited"
+    if re.search(r"\bbot\b", message) or any(marker in message for marker in ("captcha", "not a bot", "po token")):
+        return "bot_challenge"
+    if any(
+        marker in message
+        for marker in (
+            "timeout",
+            "timed out",
+            "connection reset",
+            "connection refused",
+            "proxyerror",
+            "name resolution",
+            "dns",
+        )
+    ):
+        return "network_error"
+    if any(marker in message for marker in ("403", "forbidden", "permission denied")):
+        return "forbidden"
+    if any(marker in message for marker in ("oauth", "access token", "authentication required")):
+        return "auth_error"
+    if any(marker in message for marker in ("no supported subtitles", "no subtitles available", "no caption tracks")):
+        return "no_captions"
+    return "unknown"
 
 
 class _TimeoutSession(Session):
     def __init__(self, timeout: float) -> None:
         super().__init__()
         self.timeout = timeout
+        self.deadline: float | None = None
+
+    def set_deadline(self, deadline: float | None) -> None:
+        self.deadline = deadline
 
     def request(self, method: str, url: str, **kwargs):
-        kwargs.setdefault("timeout", self.timeout)
+        timeout = self.timeout
+        if self.deadline is not None:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Transcript total timeout exhausted")
+            timeout = min(timeout, remaining)
+        kwargs.setdefault("timeout", timeout)
         return super().request(method, url, **kwargs)
 
 
@@ -85,6 +165,95 @@ def _positive_timeout(value: object, name: str) -> float:
     if not math.isfinite(timeout) or timeout <= 0:
         raise TranscriptFetchError(f"{name} must be a positive finite number")
     return timeout
+
+
+def _positive_int(value: object, name: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise TranscriptFetchError(f"{name} must be a positive integer") from exc
+    if parsed <= 0:
+        raise TranscriptFetchError(f"{name} must be a positive integer")
+    return parsed
+
+
+def _transcript_total_timeout(timeout: float | None = None) -> float:
+    if timeout is not None:
+        return _positive_timeout(timeout, "transcript_total_timeout")
+
+    raw = os.environ.get(TRANSCRIPT_TOTAL_TIMEOUT_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_TRANSCRIPT_TOTAL_TIMEOUT
+    return _positive_timeout(raw, TRANSCRIPT_TOTAL_TIMEOUT_ENV)
+
+
+def _max_client_attempts(value: int | None = None) -> int:
+    if value is not None:
+        return _positive_int(value, "max_client_attempts")
+
+    raw = os.environ.get(MAX_CLIENT_ATTEMPTS_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_MAX_CLIENT_ATTEMPTS
+    return _positive_int(raw, MAX_CLIENT_ATTEMPTS_ENV)
+
+
+def _remaining_budget(deadline: float | None, stage: str) -> float | None:
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TranscriptFetchError(
+            f"Transcript total timeout exhausted before {stage}",
+            reason="timeout",
+            stage=stage,
+        )
+    return remaining
+
+
+def _emit_stage(
+    observer: TranscriptStageObserver | None,
+    stage: str,
+    result: str,
+    *,
+    reason: str | None = None,
+    error: str | None = None,
+    cookies_loaded: bool | None = None,
+) -> None:
+    if observer is None:
+        return
+    event: dict[str, object] = {"stage": stage, "result": result}
+    if reason is not None:
+        event["reason"] = reason
+    if error is not None:
+        event["error"] = error
+    if cookies_loaded is not None:
+        event["cookies_loaded"] = cookies_loaded
+    observer(event)
+
+
+def _probe_outbound_ip(proxy_url: str | None, timeout: float) -> dict[str, object]:
+    """Check the observed egress IP without exposing proxy configuration."""
+    endpoint = os.environ.get(IP_CHECK_URL_ENV, DEFAULT_IP_CHECK_URL)
+    session = Session()
+    session.trust_env = False
+    if proxy_url:
+        session.proxies.update({"http": proxy_url, "https": proxy_url})
+
+    try:
+        response = session.get(endpoint, timeout=min(timeout, 5.0))
+        response.raise_for_status()
+        payload = response.json()
+        value = payload.get("ip") if isinstance(payload, dict) else payload
+        ip = str(value).strip()
+        ipaddress.ip_address(ip)
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "reason": "network_error",
+            "error": _safe_error(exc),
+        }
+
+    return {"status": "success", "ip": ip}
 
 
 def _youtube_transcript_api_request_timeout(timeout: float | None = None) -> float:
@@ -288,6 +457,8 @@ def fetch_transcript_via_ytdlp(
     cookies_from_browser: str | None = None,
     client: str = "web",
     ytdlp_socket_timeout: float | None = None,
+    deadline: float | None = None,
+    attempt_observer: TranscriptStageObserver | None = None,
 ) -> str:
     """Fetch transcript via yt-dlp subtitle extraction and downloader."""
     import yt_dlp
@@ -301,32 +472,110 @@ def fetch_transcript_via_ytdlp(
     if cookies_from_browser:
         ydl_opts["cookiesfrombrowser"] = _cookies_from_browser_option(cookies_from_browser)
 
+    _remaining_budget(deadline, "metadata")
+    _emit_stage(attempt_observer, "metadata", "started")
+    ydl = None
+    cookies_loaded: bool | None = None
+    current_stage = "metadata"
     try:
+        remaining = _remaining_budget(deadline, "metadata")
+        if remaining is not None:
+            configured_timeout = ytdlp_socket_timeout
+            if configured_timeout is None:
+                configured_timeout = remaining
+            else:
+                configured_timeout = min(_positive_timeout(configured_timeout, "ytdlp_socket_timeout"), remaining)
+            ytdlp_socket_timeout = configured_timeout
         _apply_ytdlp_socket_timeout(ydl_opts, ytdlp_socket_timeout)
         _apply_client_options(ydl_opts, client)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            if cookies_from_browser:
+                try:
+                    cookies_loaded = bool(len(ydl.cookiejar))
+                except Exception:
+                    cookies_loaded = None
             info = ydl.extract_info(url, download=False)
             if info is None:
-                raise TranscriptFetchError(f"yt-dlp returned no info for video {video_id}")
+                raise TranscriptFetchError(
+                    f"yt-dlp returned no info for video {video_id}",
+                    reason="unknown",
+                    stage="metadata",
+                )
 
+            _emit_stage(
+                attempt_observer,
+                "metadata",
+                "success",
+                cookies_loaded=cookies_loaded,
+            )
+
+            current_stage = "track_discovery"
+            _emit_stage(attempt_observer, "track_discovery", "started")
             selected = _select_subtitle_track(info, languages)
             if selected is None:
-                raise TranscriptFetchError("No supported subtitles available via yt-dlp")
+                error = TranscriptFetchError(
+                    "No supported subtitles available via yt-dlp",
+                    reason="no_captions",
+                    stage="track_discovery",
+                )
+                raise error
+
+            _emit_stage(
+                attempt_observer,
+                "track_discovery",
+                "success",
+                cookies_loaded=cookies_loaded,
+            )
 
             selected_lang, sub_info = selected
             ext = str(sub_info.get("ext") or "sub")
             safe_lang = re.sub(r"[^A-Za-z0-9_.-]+", "_", selected_lang)
 
+            current_stage = "subtitle_download"
+            _remaining_budget(deadline, "subtitle_download")
+            _emit_stage(attempt_observer, "subtitle_download", "started")
             with tempfile.TemporaryDirectory(prefix="youtube-tools-mcp-subs-") as tmpdir:
                 subtitle_path = Path(tmpdir) / f"{video_id}.{safe_lang}.{ext}"
                 _download_subtitle_with_ytdlp(ydl, info, sub_info, subtitle_path)
                 raw = subtitle_path.read_text(encoding="utf-8")
 
-            return _format_snippets(_parse_downloaded_subtitles(raw, ext))
-    except TranscriptFetchError:
+            result = _format_snippets(_parse_downloaded_subtitles(raw, ext))
+            _emit_stage(
+                attempt_observer,
+                "subtitle_download",
+                "success",
+                cookies_loaded=cookies_loaded,
+            )
+            return result
+    except TranscriptFetchError as exc:
+        if exc.stage is None:
+            exc.stage = current_stage
+        if exc.reason == "unknown":
+            exc.reason = _classify_error(exc)
+        _emit_stage(
+            attempt_observer,
+            exc.stage,
+            "failed",
+            reason=exc.reason,
+            error=_safe_error(exc),
+            cookies_loaded=cookies_loaded,
+        )
         raise
     except Exception as exc:
-        raise TranscriptFetchError(f"Failed to fetch subtitles via yt-dlp: {exc}") from exc
+        reason = _classify_error(exc)
+        error = TranscriptFetchError(
+            f"Failed to fetch subtitles via yt-dlp: {exc}",
+            reason=reason,
+            stage=current_stage,
+        )
+        _emit_stage(
+            attempt_observer,
+            current_stage,
+            "failed",
+            reason=reason,
+            error=_safe_error(error),
+        )
+        raise error from exc
 
 
 class TranscriptFetcher:
@@ -339,21 +588,29 @@ class TranscriptFetcher:
         client: str = "web",
         transcript_api_timeout: float | None = None,
         ytdlp_socket_timeout: float | None = None,
+        max_client_attempts: int | None = None,
+        total_timeout: float | None = None,
     ) -> None:
         resolved = get_proxy_url(proxy_url)
-        http_client = _TimeoutSession(_youtube_transcript_api_request_timeout(transcript_api_timeout))
+        self._api_http_client = _TimeoutSession(_youtube_transcript_api_request_timeout(transcript_api_timeout))
         if resolved is not None:
             proxy_cfg = GenericProxyConfig(http_url=resolved, https_url=resolved)
-            self._api = YouTubeTranscriptApi(proxy_config=proxy_cfg, http_client=http_client)
+            self._api = YouTubeTranscriptApi(proxy_config=proxy_cfg, http_client=self._api_http_client)
         else:
-            self._api = YouTubeTranscriptApi(http_client=http_client)
+            self._api = YouTubeTranscriptApi(http_client=self._api_http_client)
         self._proxy_url = resolved
         self._cookies_from_browser = cookies_from_browser
         self._client = client
         self._ytdlp_socket_timeout = ytdlp_socket_timeout
+        self._max_client_attempts = _max_client_attempts(max_client_attempts)
+        self._total_timeout = _transcript_total_timeout(total_timeout)
+        self._active_deadline: float | None = None
+        self._active_attempt_observer: TranscriptStageObserver | None = None
 
     def _fetch_yta(self, video_id: str, languages: tuple[str, ...]) -> str:
         """Fetch via youtube-transcript-api and format output."""
+        _remaining_budget(self._active_deadline, "transcript_api")
+        self._api_http_client.set_deadline(self._active_deadline)
         transcript = self._api.fetch(video_id, languages=list(languages))
         lines: list[str] = []
         for snippet in transcript:
@@ -380,6 +637,8 @@ class TranscriptFetcher:
             cookies_from_browser=self._cookies_from_browser,
             client=client,
             ytdlp_socket_timeout=self._ytdlp_socket_timeout,
+            deadline=self._active_deadline,
+            attempt_observer=self._active_attempt_observer,
         )
 
     def _client_candidates(self) -> list[str]:
@@ -387,7 +646,8 @@ class TranscriptFetcher:
         defaults = ["web", "android", "ios", "tv_embedded"]
         if self._client == "auto":
             defaults = ["auto", *defaults]
-        return [self._client, *(client for client in defaults if client != self._client)]
+        ordered = [self._client, *(client for client in defaults if client != self._client)]
+        return ordered[: self._max_client_attempts]
 
     @staticmethod
     def _should_rotate_client(exc: TranscriptFetchError) -> bool:
@@ -397,24 +657,7 @@ class TranscriptFetcher:
         exceptions, so the check intentionally uses the rendered message.
         Ordinary parsing/file errors should go straight to the next fallback.
         """
-        message = str(exc).lower()
-        markers = (
-            "bot",
-            "captcha",
-            "sign in",
-            "sign-in",
-            "login",
-            "http error 403",
-            "http error 429",
-            "too many requests",
-            "po token",
-            "player response",
-            "confirm you're not a bot",
-            "no supported subtitles",
-            "no subtitles available",
-            "requested format is not available",
-        )
-        return any(marker in message for marker in markers)
+        return _classify_error(exc) in {"bot_challenge", "no_captions"}
 
     def _fetch_via_ytdlp_with_clients(
         self,
@@ -425,6 +668,7 @@ class TranscriptFetcher:
         errors: list[str] = []
         candidates = self._client_candidates()
         for index, client in enumerate(candidates):
+            _remaining_budget(self._active_deadline, f"yt_dlp client={client}")
             try:
                 if client == self._client:
                     result = self._fetch_via_ytdlp(video_id, languages)
@@ -438,76 +682,182 @@ class TranscriptFetcher:
 
         raise TranscriptFetchError("yt-dlp transcript attempts failed: " + " | ".join(errors))
 
-    def diagnose(self, video_id: str, languages: tuple[str, ...]) -> dict[str, object]:
-        """Probe transcript backends and return non-secret attempt diagnostics."""
+    def diagnose(
+        self,
+        video_id: str,
+        languages: tuple[str, ...],
+        *,
+        check_ip: bool = False,
+    ) -> dict[str, object]:
+        """Probe transcript backends within one bounded, structured budget."""
         attempts: list[dict[str, object]] = []
-        for index, client in enumerate(self._client_candidates()):
-            try:
-                value = self._fetch_via_ytdlp_client(video_id, languages, client)
-                attempts.append(
-                    {
+        deadline = time.monotonic() + self._total_timeout
+        candidates = self._client_candidates()
+        network: dict[str, object] = {
+            "status": "not_requested",
+            "proxy_configured": self._proxy_url is not None,
+        }
+        previous_deadline = self._active_deadline
+        previous_observer = self._active_attempt_observer
+
+        try:
+            if check_ip:
+                remaining = _remaining_budget(deadline, "outbound_ip_check")
+                assert remaining is not None
+                network = {
+                    "proxy_configured": self._proxy_url is not None,
+                    **_probe_outbound_ip(self._proxy_url, remaining),
+                }
+            client_attempts_used = 0
+            for index, client in enumerate(candidates):
+                client_attempts_used += 1
+                attempt: dict[str, object] = {
+                    "backend": "yt_dlp",
+                    "client": client,
+                    "proxy_configured": self._proxy_url is not None,
+                    "cookies_configured": self._cookies_from_browser is not None,
+                    "cookies_loaded": False if self._cookies_from_browser is None else None,
+                    "stages": [],
+                }
+
+                def observe(event: dict[str, object], current: dict[str, object] = attempt) -> None:
+                    stages = current["stages"]
+                    assert isinstance(stages, list)
+                    stages.append(event)
+                    if "cookies_loaded" in event:
+                        current["cookies_loaded"] = event["cookies_loaded"]
+
+                self._active_deadline = deadline
+                self._active_attempt_observer = observe
+                try:
+                    value = self._fetch_via_ytdlp_client(video_id, languages, client)
+                    attempt.update({"result": "success", "lines": len(value.splitlines())})
+                    attempts.append(attempt)
+                    return {
+                        "status": "success",
                         "backend": "yt_dlp",
-                        "client": client,
-                        "proxy_configured": self._proxy_url is not None,
-                        "cookies_configured": self._cookies_from_browser is not None,
-                        "result": "success",
-                        "lines": len(value.splitlines()),
+                        "attempts": attempts,
+                        "network": network,
+                        "budget": self._diagnostic_budget(deadline, client_attempts_used),
                     }
-                )
-                return {"status": "success", "backend": "yt_dlp", "attempts": attempts}
+                except Exception as exc:
+                    attempt.update(
+                        {
+                            "result": "failed",
+                            "reason": _classify_error(exc),
+                            "error": _safe_error(exc),
+                        }
+                    )
+                    attempts.append(attempt)
+                    if index == len(candidates) - 1 or not isinstance(exc, TranscriptFetchError):
+                        break
+                    if not self._should_rotate_client(exc):
+                        break
+
+            yta_attempt: dict[str, object] = {
+                "backend": "youtube_transcript_api",
+                "client": "not_applicable",
+                "proxy_configured": self._proxy_url is not None,
+                "cookies_configured": False,
+                "cookies_loaded": False,
+                "stages": [],
+            }
+            yta_attempt["stages"].append({"stage": "transcript_fetch", "result": "started"})
+            self._active_deadline = deadline
+            self._active_attempt_observer = None
+            try:
+                value = self._fetch_yta(video_id, languages)
+                yta_attempt.update({"result": "success", "lines": len(value.splitlines())})
+                yta_attempt["stages"].append({"stage": "transcript_fetch", "result": "success"})
+                attempts.append(yta_attempt)
+                return {
+                    "status": "success",
+                    "backend": "youtube_transcript_api",
+                    "attempts": attempts,
+                    "network": network,
+                    "budget": self._diagnostic_budget(deadline, client_attempts_used),
+                }
             except Exception as exc:
-                attempts.append(
+                yta_attempt.update(
                     {
-                        "backend": "yt_dlp",
-                        "client": client,
-                        "proxy_configured": self._proxy_url is not None,
-                        "cookies_configured": self._cookies_from_browser is not None,
                         "result": "failed",
+                        "reason": _classify_error(exc),
                         "error": _safe_error(exc),
                     }
                 )
-                if index == len(self._client_candidates()) - 1 or not isinstance(exc, TranscriptFetchError):
-                    break
-                if not self._should_rotate_client(exc):
-                    break
+                yta_attempt["stages"].append(
+                    {
+                        "stage": "transcript_fetch",
+                        "result": "failed",
+                        "reason": _classify_error(exc),
+                    }
+                )
+                attempts.append(yta_attempt)
 
-        try:
-            value = self._fetch_yta(video_id, languages)
-            attempts.append(
-                {
-                    "backend": "youtube_transcript_api",
-                    "client": "not_applicable",
-                    "proxy_configured": self._proxy_url is not None,
-                    "cookies_configured": False,
-                    "result": "success",
-                    "lines": len(value.splitlines()),
+            captions_attempt: dict[str, object] = {
+                "backend": "youtube_data_api",
+                "client": "not_applicable",
+                "proxy_configured": self._proxy_url is not None,
+                "cookies_configured": False,
+                "cookies_loaded": False,
+                "stages": [],
+            }
+            self._active_attempt_observer = lambda event: captions_attempt["stages"].append(event)
+            self._active_deadline = deadline
+            try:
+                value = self._fetch_via_captions_api(video_id, languages)
+                captions_attempt.update({"result": "success", "lines": len(value.splitlines())})
+                attempts.append(captions_attempt)
+                return {
+                    "status": "success",
+                    "backend": "youtube_data_api",
+                    "attempts": attempts,
+                    "network": network,
+                    "budget": self._diagnostic_budget(deadline, client_attempts_used),
                 }
-            )
-            return {"status": "success", "backend": "youtube_transcript_api", "attempts": attempts}
-        except Exception as exc:
-            attempts.append(
-                {
-                    "backend": "youtube_transcript_api",
-                    "client": "not_applicable",
-                    "proxy_configured": self._proxy_url is not None,
-                    "cookies_configured": False,
-                    "result": "failed",
-                    "error": _safe_error(exc),
+            except Exception as exc:
+                captions_attempt.update(
+                    {
+                        "result": "failed",
+                        "reason": _classify_error(exc),
+                        "error": _safe_error(exc),
+                    }
+                )
+                attempts.append(captions_attempt)
+                return {
+                    "status": "failed",
+                    "attempts": attempts,
+                    "network": network,
+                    "budget": self._diagnostic_budget(deadline, client_attempts_used),
                 }
-            )
-            return {"status": "failed", "attempts": attempts}
+        finally:
+            self._active_deadline = previous_deadline
+            self._active_attempt_observer = previous_observer
+            self._api_http_client.set_deadline(previous_deadline)
+
+    def _diagnostic_budget(self, deadline: float, client_attempts: int) -> dict[str, object]:
+        return {
+            "max_client_attempts": self._max_client_attempts,
+            "total_timeout_seconds": self._total_timeout,
+            "client_attempts_used": client_attempts,
+            "timed_out": time.monotonic() >= deadline,
+        }
 
     def _fetch_via_captions_api(self, video_id: str, languages: tuple[str, ...]) -> str:
         """Fetch via YouTube Data API captions (requires OAuth)."""
         from youtube_tools_mcp.youtube.captions import fetch_transcript_via_data_api
 
         api_key = os.environ.get("YOUTUBE_API_KEY")
-        return fetch_transcript_via_data_api(
-            video_id,
-            languages,
-            api_key=api_key,
-            proxy=self._proxy_url,
-        )
+        kwargs: dict[str, object] = {
+            "api_key": api_key,
+            "proxy": self._proxy_url,
+        }
+        remaining = _remaining_budget(self._active_deadline, "youtube_data_api")
+        if remaining is not None:
+            kwargs["timeout"] = remaining
+        if self._active_attempt_observer is not None:
+            kwargs["attempt_observer"] = self._active_attempt_observer
+        return fetch_transcript_via_data_api(video_id, languages, **kwargs)
 
     def _try_fallbacks(
         self,
@@ -530,12 +880,17 @@ class TranscriptFetcher:
         except TranscriptFetchError as exc:
             errors.append(f"captions API fallback failed: {exc}")
         details = " | ".join(errors) if errors else "no fallback attempts were made"
+        reason = _classify_error(original_exc)
         if isinstance(original_exc, CouldNotRetrieveTranscript):
             raise TranscriptFetchError(
-                f"Failed to fetch transcript: {original_exc}. Fallback attempts: {details}"
+                f"Failed to fetch transcript: {original_exc}. Fallback attempts: {details}",
+                reason=reason,
+                stage="fallbacks",
             ) from original_exc
         raise TranscriptFetchError(
-            f"Unexpected error fetching transcript: {original_exc}. Fallback attempts: {details}"
+            f"Unexpected error fetching transcript: {original_exc}. Fallback attempts: {details}",
+            reason=reason,
+            stage="fallbacks",
         ) from original_exc
 
     def fetch(self, video_id: str, languages: tuple[str, ...] = ("en",)) -> str:
@@ -543,45 +898,54 @@ class TranscriptFetcher:
 
         Returns a string with lines like "[MM:SS] transcript text".
         """
-        ytdlp_first_errors: list[str] = []
-        if self._cookies_from_browser:
-            try:
-                return self._fetch_via_ytdlp_with_clients(video_id, languages)
-            except TranscriptFetchError as exc:
-                ytdlp_first_errors.append(f"yt-dlp first attempt failed: {exc}")
-
+        previous_deadline = self._active_deadline
+        previous_observer = self._active_attempt_observer
+        self._active_deadline = time.monotonic() + self._total_timeout
+        self._active_attempt_observer = None
         try:
-            return self._fetch_yta(video_id, languages)
-        except (TranscriptsDisabled, InvalidVideoId, VideoUnplayable) as exc:
-            # These errors describe the video itself, not just one transcript
-            # backend or language selection.
-            raise _map_exception(exc) from exc
-        except NoTranscriptFound as exc:
-            # youtube-transcript-api can fail to enumerate a track while
-            # yt-dlp still sees it (different clients/endpoints/languages).
-            # Treat this as a backend miss and continue the normal fallbacks.
-            return self._try_fallbacks(
-                video_id,
-                languages,
-                exc,
-                skip_ytdlp=bool(self._cookies_from_browser),
-                initial_errors=ytdlp_first_errors,
-            )
-        except CouldNotRetrieveTranscript as exc:
-            # IP blocked or other retrievable failure — try fallbacks
-            return self._try_fallbacks(
-                video_id,
-                languages,
-                exc,
-                skip_ytdlp=bool(self._cookies_from_browser),
-                initial_errors=ytdlp_first_errors,
-            )
-        except Exception as exc:
-            # Unexpected error — try fallbacks
-            return self._try_fallbacks(
-                video_id,
-                languages,
-                exc,
-                skip_ytdlp=bool(self._cookies_from_browser),
-                initial_errors=ytdlp_first_errors,
-            )
+            ytdlp_first_errors: list[str] = []
+            if self._cookies_from_browser:
+                try:
+                    return self._fetch_via_ytdlp_with_clients(video_id, languages)
+                except TranscriptFetchError as exc:
+                    ytdlp_first_errors.append(f"yt-dlp first attempt failed: {exc}")
+
+            try:
+                return self._fetch_yta(video_id, languages)
+            except (TranscriptsDisabled, InvalidVideoId, VideoUnplayable) as exc:
+                # These errors describe the video itself, not just one transcript
+                # backend or language selection.
+                raise _map_exception(exc) from exc
+            except NoTranscriptFound as exc:
+                # youtube-transcript-api can fail to enumerate a track while
+                # yt-dlp still sees it (different clients/endpoints/languages).
+                # Treat this as a backend miss and continue the normal fallbacks.
+                return self._try_fallbacks(
+                    video_id,
+                    languages,
+                    exc,
+                    skip_ytdlp=bool(self._cookies_from_browser),
+                    initial_errors=ytdlp_first_errors,
+                )
+            except CouldNotRetrieveTranscript as exc:
+                # IP blocked or other retrievable failure — try fallbacks
+                return self._try_fallbacks(
+                    video_id,
+                    languages,
+                    exc,
+                    skip_ytdlp=bool(self._cookies_from_browser),
+                    initial_errors=ytdlp_first_errors,
+                )
+            except Exception as exc:
+                # Unexpected error — try fallbacks
+                return self._try_fallbacks(
+                    video_id,
+                    languages,
+                    exc,
+                    skip_ytdlp=bool(self._cookies_from_browser),
+                    initial_errors=ytdlp_first_errors,
+                )
+        finally:
+            self._active_deadline = previous_deadline
+            self._active_attempt_observer = previous_observer
+            self._api_http_client.set_deadline(previous_deadline)

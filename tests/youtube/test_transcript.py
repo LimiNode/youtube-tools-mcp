@@ -70,6 +70,56 @@ class TestTimeoutSession:
 
 
 class TestTranscriptFetcher:
+    def test_client_candidates_are_capped(self) -> None:
+        fetcher = TranscriptFetcher(client="web", max_client_attempts=2)
+
+        assert fetcher._client_candidates() == ["web", "android"]
+
+    def test_diagnose_classifies_forbidden_and_includes_budget(self) -> None:
+        fetcher = TranscriptFetcher(client="web", max_client_attempts=4, total_timeout=30)
+        with (
+            patch.object(
+                TranscriptFetcher,
+                "_fetch_via_ytdlp_client",
+                side_effect=TranscriptFetchError("HTTP Error 403: Forbidden", reason="forbidden"),
+            ),
+            patch.object(
+                TranscriptFetcher,
+                "_fetch_yta",
+                side_effect=NoTranscriptFound(SAMPLE_VIDEO_ID, ["en"], []),
+            ),
+            patch.object(
+                TranscriptFetcher,
+                "_fetch_via_captions_api",
+                side_effect=TranscriptFetchError("OAuth token not available"),
+            ),
+        ):
+            result = fetcher.diagnose(SAMPLE_VIDEO_ID, ("en",))
+
+        assert result["status"] == "failed"
+        assert result["attempts"][0]["reason"] == "forbidden"
+        assert result["budget"]["max_client_attempts"] == 4
+        assert result["budget"]["client_attempts_used"] == 1
+        assert result["attempts"][-1]["backend"] == "youtube_data_api"
+
+    def test_diagnose_can_include_observed_egress_ip(self) -> None:
+        fetcher = TranscriptFetcher(total_timeout=30)
+        with (
+            patch.object(TranscriptFetcher, "_fetch_via_ytdlp_client", return_value="[00:00] line"),
+            patch(
+                "youtube_tools_mcp.youtube.transcript._probe_outbound_ip",
+                return_value={"status": "success", "ip": "203.0.113.10"},
+            ) as probe,
+        ):
+            result = fetcher.diagnose(SAMPLE_VIDEO_ID, ("en",), check_ip=True)
+
+        assert result["network"] == {
+            "proxy_configured": False,
+            "status": "success",
+            "ip": "203.0.113.10",
+        }
+        probe.assert_called_once()
+
     @patch("youtube_tools_mcp.youtube.transcript.YouTubeTranscriptApi")
     def test_fetch_returns_formatted_transcript(self, mock_api_cls: MagicMock) -> None:
         mock_api = mock_api_cls.return_value
@@ -484,6 +534,52 @@ class TestParseJson3Events:
 
 
 class TestFetchTranscriptViaYtdlp:
+    @patch("yt_dlp.YoutubeDL")
+    def test_observer_reports_stages_and_loaded_cookies(self, mock_ytdl_cls: MagicMock) -> None:
+        mock_ydl = _mock_ytdlp_context(
+            mock_ytdl_cls,
+            {
+                "automatic_captions": {
+                    "en": [{"ext": "json3", "url": "https://subs.example/en.json3"}],
+                },
+            },
+        )
+        mock_ydl.cookiejar = ["session-cookie"]
+
+        def write_subtitle(filename: str, sub_info: dict, subtitle: bool = False) -> None:
+            Path(filename).write_text(
+                json.dumps(
+                    {
+                        "events": [
+                            {
+                                "tStartMs": 0,
+                                "dDurationMs": 1000,
+                                "segs": [{"utf8": "Hello"}],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        mock_ydl.dl.side_effect = write_subtitle
+        events: list[dict[str, object]] = []
+
+        result = fetch_transcript_via_ytdlp(
+            SAMPLE_VIDEO_ID,
+            languages=("en",),
+            cookies_from_browser="firefox",
+            attempt_observer=events.append,
+        )
+
+        assert result == "[00:00] Hello"
+        assert [event["stage"] for event in events if event["result"] == "success"] == [
+            "metadata",
+            "track_discovery",
+            "subtitle_download",
+        ]
+        assert all(event.get("cookies_loaded") is True for event in events if "cookies_loaded" in event)
+
     @patch("yt_dlp.YoutubeDL")
     def test_downloads_selected_json3_with_ytdlp_downloader(self, mock_ytdl_cls: MagicMock) -> None:
         mock_ydl = _mock_ytdlp_context(
